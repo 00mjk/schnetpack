@@ -4,6 +4,8 @@ class Properties:
     """
 
     # geometry
+
+    xtb_props = "_xtb_props"
     Z = "_atomic_numbers"
     charge = "_charge"
     atom_mask = "_atom_mask"
@@ -56,6 +58,7 @@ class Properties:
         polarizability_derivatives,
         electric_field,
         magnetic_field,
+        xtb_props,
     ]
 
     external_fields = [electric_field, magnetic_field]

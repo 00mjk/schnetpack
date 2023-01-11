@@ -35,6 +35,7 @@ class AtomisticModel(nn.Module):
         self.requires_dr = any([om.derivative for om in self.output_modules])
         # For stress tensor
         self.requires_stress = any([om.stress for om in self.output_modules])
+        #print(representation)
 
     def forward(self, inputs):
         """
@@ -61,8 +62,9 @@ class AtomisticModel(nn.Module):
             inputs[Properties.cell] = inputs[Properties.cell] + torch.matmul(
                 inputs[Properties.cell], displacement
             )
-
+        #print(inputs)
         inputs["representation"] = self.representation(inputs)
+
         outs = {}
         for output_model in self.output_modules:
             outs.update(output_model(inputs))

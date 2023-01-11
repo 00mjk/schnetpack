@@ -106,8 +106,15 @@ class AtomsData(Dataset):
         environment_provider=SimpleEnvironmentProvider(),
         collect_triples=False,
         centering_function=get_center_of_mass,
+        xtb_props=None
     ):
+
+        #xtb_props
+        if xtb_props!=None:
+            self.xtb_props = xtb_props
+            #print(self.xtb_props, 'fuk_this_shit')
         # checks
+
         if not dbpath.endswith(".db"):
             raise AtomsDataError(
                 "Invalid dbpath! Please make sure to add the file extension '.db' to "
@@ -251,7 +258,9 @@ class AtomsData(Dataset):
             collect_triples=self.collect_triples,
             centering_function=self.centering_function,
             output=properties,
+            xtb_props=None,
         )
+        #print(properties) #this is used.
 
         return at, properties
 
@@ -646,6 +655,7 @@ def _convert_atoms(
     collect_triples=False,
     centering_function=None,
     output=None,
+    xtb_props=None,
 ):
     """
     Helper function to convert ASE atoms object to SchNetPack input format.
@@ -663,11 +673,20 @@ def _convert_atoms(
         dict of torch.Tensor: Properties including neighbor lists and masks
             reformated into SchNetPack input format.
 
+    P.S. The function was modified to include xTB props!!!
+
     """
     if output is None:
         inputs = {}
     else:
         inputs = output
+    # xTB atom properties
+    if xtb_props is None:
+        pass
+    else:
+        xtb_props = xtb_props
+        inputs[Properties.xtb_props] = xtb_props
+
 
     # Elemental composition
     inputs[Properties.Z] = atoms.numbers.astype(np.int)
@@ -754,7 +773,7 @@ class AtomsConverter:
         # Get device
         self.device = device
 
-    def __call__(self, atoms):
+    def __call__(self, atoms, xtb_props=None):
         """
         Args:
             atoms (ase.Atoms): Atoms object of molecule
@@ -763,7 +782,13 @@ class AtomsConverter:
             dict of torch.Tensor: Properties including neighbor lists and masks
                 reformated into SchNetPack input format.
         """
-        inputs = _convert_atoms(atoms, self.environment_provider, self.collect_triples)
+        inputs = _convert_atoms(atoms, self.environment_provider, self.collect_triples, xtb_props=None)
+        #print(inputs, 'this is the place')
+        #xtb_props = torch.from_numpy(xtb_props)
+        try:
+            inputs[Properties.xtb_props] = xtb_props
+        except:
+            pass
         inputs = torchify_dict(inputs)
 
         # Calculate masks
@@ -785,3 +810,8 @@ class AtomsConverter:
             inputs[key] = value.unsqueeze(0).to(self.device)
 
         return inputs
+
+
+
+
+

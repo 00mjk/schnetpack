@@ -5,259 +5,11 @@ import schnetpack.nn as snn
 from schnetpack.data import StatisticsAccumulator
 from schnetpack import Properties
 
-__all__ = ["HDNNException", "PhysicalSymFunctions", "SymmetryFunctions", "BehlerSFBlock", "StandardizeSF"]
+__all__ = ["HDNNException", "SymmetryFunctions", "BehlerSFBlock", "StandardizeSF"]
 
 
 class HDNNException(Exception):
     pass
-
-
-class PhysicalSymFunctions(nn.Module):
-    """
-        Compute atom-centered symmetry functions [#acsf1]_ and weighted variant thereof as described
-        in Reference [#wacsf1]_.
-        By default, the atomic number is used as element depended weight. However, by specifying the
-        trainz=True, a more general elemental embedding is learned instead.
-
-        Args:
-            n_radial (int):  Number of radial functions
-            n_angular (int): Number of angular functions
-            zetas (set of int): Set of exponents used to compute the angular term, default is zetas={1}
-            cutoff (callable): Cutoff function, default is the typical cosine cutoff function
-            cutoff_radius (float): Cutoff radius, default are 5 Angstrom
-            centered (bool): Whether centered Gaussians should be used for radial functions. Angular functions use centered Gaussians by default.
-            crossterms (bool): Whether cutoff and exponential terms of the distance r_jk between both neighbors should be included in the angular functions. Default is False
-            sharez (bool): Whether angular and radial functions should use the same elemental weighting. The default is true.
-            initz (str): Initialize physics based weights (default and only='xTB_weighted')
-            len_embedding (int): Number of elemental weights, default is 1. If more are used, embedding vectors similar to SchNet can be obtained.
-            pairwise_elements (bool): Recombine elemental embedding vectors in the angular functions via an outer product. If e.g. one-hot encoding
-                                      is used for the elements, this is equivalent to standard Behler functions
-                                      (default=False).
-    """
-
-    def __init__(
-            self,
-            n_radial=22,
-            n_angular=5,
-            zetas={1},
-            cutoff=snn.CosineCutoff,
-            cutoff_radius=5.0,
-            centered=False,
-            crossterms=False,
-            sharez=True,
-            trainz=False,
-            initz="xTB_weighted",
-            len_embedding=5,
-            pairwise_elements=False,
-    ):
-        super(PhysicalSymFunctions, self).__init__()
-
-        self.n_radial = n_radial
-        self.n_angular = n_angular
-        self.len_embedding = len_embedding
-        self.n_elements = None
-        self.n_theta = 2 * len(zetas)
-
-        # Initialize cutoff function
-        self.cutoff_radius = cutoff_radius
-        self.cutoff = cutoff(cutoff=self.cutoff_radius)
-
-        # Check for general stupidity:
-        if self.n_angular < 1 and self.n_radial < 1:
-            raise ValueError("At least one type of SF required")
-
-        if self.n_angular > 0:
-            # Get basic filters
-            self.theta_filter = snn.BehlerAngular(zetas=zetas)
-            self.angular_filter = snn.GaussianSmearing(
-                start=1.0,
-                stop=self.cutoff_radius - 0.5,
-                n_gaussians=n_angular,
-                centered=True,
-            )
-            self.ADF = snn.AngularDistribution(
-                self.angular_filter,
-                self.theta_filter,
-                cutoff_functions=self.cutoff,
-                crossterms=crossterms,
-                pairwise_elements=pairwise_elements,
-            )
-        else:
-            self.ADF = None
-
-        if self.n_radial > 0:
-            # Get basic filters (if centered Gaussians are requested, start is set to 0.5
-            if centered:
-                radial_start = 1.0
-            else:
-                radial_start = 0.5
-            self.radial_filter = snn.GaussianSmearing(
-                start=radial_start,
-                stop=self.cutoff_radius - 0.5,
-                n_gaussians=n_radial,
-                centered=centered,
-            )
-            self.RDF = snn.RadialDistribution(
-                self.radial_filter, cutoff_function=self.cutoff
-            )
-        else:
-            self.RDF = None
-
-        # Initialize the atomtype embeddings
-        self.radial_Z = self.initz(initz)  # elements were delted as inputs!!!
-
-        # check whether angular functions should use the same embedding
-        if sharez:
-            self.angular_Z = self.radial_Z
-        else:
-            self.angular_Z = self.initz(initz)  # elements were delted as inputs!!!
-
-        # Turn of training of embeddings unless requested explicitly
-        if not trainz:
-            # Turn off gradients
-            self.radial_Z.weight.requires_grad = False
-            self.angular_Z.weight.requires_grad = False
-
-        # Compute total number of symmetry functions
-        if not pairwise_elements:
-            self.n_symfuncs = (self.n_radial + self.n_angular * self.n_theta) * 4
-
-        # This functionality is not imported yet!!
-        # else:
-        # if the outer product is used, all unique pairs of elements are considered, leading to the factor of
-        # (N+1)/2
-        # self.n_symfuncs = (self.n_radial + self.n_angular * self.n_theta * (self.n_elements + 1) // 2) * self.n_elements
-
-    def initz(self, mode):
-        """
-        Subroutine to initialize the element dependent weights.
-
-        Args:
-            mode (str): Manner in which the weights are initialized. Possible are:
-                xTB_weighted: xTB weigh symmetry functions with xTB computed atomic properties.
-        Returns:
-            torch.nn.Embedding: Embedding layer of the initialized elemental weights.
-
-        """
-
-        if mode == "xTB_weighted":
-            # Size of an array depends on how many atom descriptors we use.
-            # At certain time we use 4 (Z, C6AA, Z-q, alpha)
-            weights = torch.zeros(4, 1)
-            z_weights = nn.Embedding(4, 1)
-            z_weights.weight.data = weights
-
-        else:
-            raise NotImplementedError(
-                "Unregognized option {:s} for initializing elemental weights. Use 'weighted', 'onehot' or 'embedding'.".format(
-                    mode
-                )
-            )
-
-        return z_weights
-
-    def forward(self, inputs):
-        """
-        Args:
-            inputs (dict of torch.Tensor): SchNetPack format dictionary of input tensors.
-
-        Returns:
-            torch.Tensor: Nbatch x Natoms x Nsymmetry_functions Tensor containing xTB_wACSFs.
-
-        """
-
-        positions = inputs[Properties.R]
-        Z = inputs[Properties.Z]
-        # This part should be fixed for possibility of importing and reading different properties!!
-        # xTB props should stand for all possible atom properties obtained with different methods!!
-        try:
-            xtb_props = inputs[Properties.xtb_props]
-        except:
-            try:
-                xtb_props = inputs['_xtb_props']
-            except:
-                print('Can not read atomic data. Please make sure it is imported')
-
-        neighbors = inputs[Properties.neighbors]
-        neighbor_mask = inputs[Properties.neighbor_mask]
-
-        cell = inputs[Properties.cell]
-        cell_offset = inputs[Properties.cell_offset]
-
-        # Compute radial functions, by first trying conventional embedings and if not working incorporating xtb_props
-        if self.RDF is not None:
-            # Get atom type embeddings
-            Z_rad = xtb_props
-            # Get atom types of neighbors
-            Z_ij = snn.neighbor_elements(Z_rad, neighbors)
-            # Compute distances
-            distances = snn.atom_distances(
-                positions,
-                neighbors,
-                neighbor_mask=neighbor_mask,
-                cell=cell,
-                cell_offsets=cell_offset,
-            )
-            radial_sf = self.RDF(
-                distances, elemental_weights=Z_ij, neighbor_mask=neighbor_mask
-            )
-        else:
-            radial_sf = None
-
-        if self.ADF is not None:
-            # Get pair indices
-            try:
-                idx_j = inputs[Properties.neighbor_pairs_j]
-                idx_k = inputs[Properties.neighbor_pairs_k]
-
-            except KeyError as e:
-                raise HDNNException(
-                    "Angular symmetry functions require "
-                    + "`collect_triples=True` in AtomsData."
-                )
-            neighbor_pairs_mask = inputs[Properties.neighbor_pairs_mask]
-
-            # Get element contributions of the pairs
-
-            Z_angular = xtb_props
-
-            Z_ij = snn.neighbor_elements(Z_angular, idx_j)
-            Z_ik = snn.neighbor_elements(Z_angular, idx_k)
-
-            # Offset indices
-            offset_idx_j = inputs[Properties.neighbor_offsets_j]
-            offset_idx_k = inputs[Properties.neighbor_offsets_k]
-
-            # Compute triple distances
-            r_ij, r_ik, r_jk = snn.triple_distances(
-                positions,
-                idx_j,
-                idx_k,
-                offset_idx_j=offset_idx_j,
-                offset_idx_k=offset_idx_k,
-                cell=cell,
-                cell_offsets=cell_offset,
-            )
-
-            angular_sf = self.ADF(
-                r_ij,
-                r_ik,
-                r_jk,
-                elemental_weights=(Z_ij, Z_ik),
-                triple_masks=neighbor_pairs_mask,
-            )
-        else:
-            angular_sf = None
-
-        # Concatenate and return symmetry functions
-        if self.RDF is None:
-            symmetry_functions = angular_sf
-        elif self.ADF is None:
-            symmetry_functions = radial_sf
-        else:
-            symmetry_functions = torch.cat((radial_sf, angular_sf), 2)
-
-        return symmetry_functions
 
 
 class SymmetryFunctions(nn.Module):
@@ -308,7 +60,7 @@ class SymmetryFunctions(nn.Module):
             cutoff_radius=5.0,
             centered=False,
             crossterms=False,
-            elements=frozenset((1, 6, 7, 8, 9)),
+            elements=frozenset((1, 6, 7, 8, 9)),  # For xtb_weighted there is no need to specify
             sharez=True,
             trainz=False,
             initz="weighted",
@@ -386,16 +138,14 @@ class SymmetryFunctions(nn.Module):
 
         # Compute total number of symmetry functions
         if not pairwise_elements:
-            self.n_symfuncs = (
-                                      self.n_radial + self.n_angular * self.n_theta
-                              ) * self.n_elements
+            if initz == 'xTB_weighted':
+                self.n_symfuncs = (self.n_radial + self.n_angular * self.n_theta) * 4
+            else:
+                self.n_symfuncs = ( self.n_radial + self.n_angular * self.n_theta) * self.n_elements
         else:
             # if the outer product is used, all unique pairs of elements are considered, leading to the factor of
             # (N+1)/2
-            self.n_symfuncs = (
-                                      self.n_radial
-                                      + self.n_angular * self.n_theta * (self.n_elements + 1) // 2
-                              ) * self.n_elements
+            self.n_symfuncs = (self.n_radial + self.n_angular * self.n_theta * (self.n_elements + 1) // 2) * self.n_elements
 
     def initz(self, mode, elements):
         """
@@ -406,6 +156,7 @@ class SymmetryFunctions(nn.Module):
                 weighted: Weigh symmetry functions with nuclear charges (wACSF)
                 onehot: Represent elements by onehot vectors. This can be used in combination with pairwise_elements
                         in order to emulate the behavior of classic Behler symmetry functions.
+                xTB_weighted: xTB weigh symmetry functions with xTB computed atomic properties.
                 embedding: Use random embeddings, which can e.g. be trained. Embedding length is modified via
                            len_embedding (default=False).
             elements (set of int): List of elements present in the molecule.
@@ -414,15 +165,16 @@ class SymmetryFunctions(nn.Module):
             torch.nn.Embedding: Embedding layer of the initialized elemental weights.
 
         """
-
         maxelements = max(elements)
         nelements = len(elements)
 
         if mode == "weighted":
             weights = torch.arange(maxelements + 1)[:, None]
             z_weights = nn.Embedding(maxelements + 1, 1)
+
             z_weights.weight.data = weights
             self.n_elements = 1
+
         elif mode == "onehot":
             weights = torch.zeros(maxelements + 1, nelements)
             for idx, Z in enumerate(elements):
@@ -433,6 +185,12 @@ class SymmetryFunctions(nn.Module):
         elif mode == "embedding":
             z_weights = nn.Embedding(maxelements + 1, self.len_embedding)
             self.n_elements = self.len_embedding
+        # Returns weights='init_xtb_props' because we will use atom weights from xTB data.
+        elif mode == "xTB_weighted":
+            weights = torch.zeros(4, 1) #size of an array depends on how many atom descriptors we use
+            z_weights = nn.Embedding(4, 1)
+            z_weights.weight.data = weights
+
         else:
             raise NotImplementedError(
                 "Unregognized option {:s} for initializing elemental weights. Use 'weighted', 'onehot' or 'embedding'.".format(
@@ -448,21 +206,38 @@ class SymmetryFunctions(nn.Module):
             inputs (dict of torch.Tensor): SchNetPack format dictionary of input tensors.
 
         Returns:
-            torch.Tensor: Nbatch x Natoms x Nsymmetry_functions Tensor containing ACSFs or wACSFs.
+            torch.Tensor: Nbatch x Natoms x Nsymmetry_functions Tensor containing ACSFs/wACSFs/xTBwACSFs.
 
         """
+
+        #print(inputs['_xtb_props'])
         positions = inputs[Properties.R]
         Z = inputs[Properties.Z]
+        try:
+            xtb_props = inputs[Properties.xtb_props]
+        except:
+            try:
+                xtb_props = inputs['_xtb_props']
+            except:
+                print('Can not read xtb data')
+
+
         neighbors = inputs[Properties.neighbors]
         neighbor_mask = inputs[Properties.neighbor_mask]
 
         cell = inputs[Properties.cell]
         cell_offset = inputs[Properties.cell_offset]
 
-        # Compute radial functions
+        # Compute radial functions, by first trying conventional embedings and if not working incorporating xtb_props
         if self.RDF is not None:
             # Get atom type embeddings
-            Z_rad = self.radial_Z(Z)
+            #try:
+
+            #    Z_rad = self.radial_Z(Z)
+
+            #except:
+            Z_rad = xtb_props
+            print(Z_rad.size(), neighbors.size())
             # Get atom types of neighbors
             Z_ij = snn.neighbor_elements(Z_rad, neighbors)
             # Compute distances
@@ -493,7 +268,12 @@ class SymmetryFunctions(nn.Module):
             neighbor_pairs_mask = inputs[Properties.neighbor_pairs_mask]
 
             # Get element contributions of the pairs
-            Z_angular = self.angular_Z(Z)
+
+            try:
+                Z_angular = self.angular_Z(Z)
+            except:
+                Z_angular = xtb_props
+
             Z_ij = snn.neighbor_elements(Z_angular, idx_j)
             Z_ik = snn.neighbor_elements(Z_angular, idx_k)
 
